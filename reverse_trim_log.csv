@@ -1,0 +1,6 @@
+time,k,bursts,burst_s,start_cm,front_cm,rear_cm,notes
+2026-09-22 19:49,0.0325,13,0.5,60,14,0,"severe drift, rear hit wall"
+2026-09-22 19:54,0.0,13,0.5,60,81,87,"drifted away from wall, opposite direction to k=0.0325"
+2026-09-22 19:58,0.01,13,0.5,60,65,66,"close to target, kitchen floor first pass"
+2026-09-23 10:19,0.01,13,0.5,60,67,62,
+2026-09-23 10:25,0.01,13,0.5,60,96,96,perfect reverse

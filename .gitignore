@@ -1,0 +1,6 @@
+photos/
+Photogrammetry Files/
+__pycache__/
+.DS_Store
+*.MP4
+*.mp4
