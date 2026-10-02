@@ -113,7 +113,7 @@ def plot_run(run_id, wps, show_names=True):
     ax.set_title("Self-check results, run %s\n%d reshoots, %d re-checks passed, "
                  "%d re-checks failed, %d escalated"
                  % (run_id, n_fill, n_fixed, n_failed, n_escalated))
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="best", fontsize=8)
     plt.tight_layout()
     out = "overlap_%s.png" % run_id
     plt.savefig(out, dpi=150)
