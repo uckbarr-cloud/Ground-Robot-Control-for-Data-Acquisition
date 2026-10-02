@@ -20,7 +20,7 @@ EXTRA_TILT_WAYPOINTS = set()
 EXTRA_TILT = 12
 
 CEILING_ENABLED = True     # set False if the tilt hardware can't reach this angle
-CEILING_TILT = -55         # steep upward tilt - unconfirmed hardware limit, test carefully
+CEILING_TILT = 85          # positive is up; +90 is straight up (tested), -30 is the down limit
 
 MIN_BATTERY_V = 10.3                 # stop cleanly before the low-battery line
 
@@ -29,21 +29,10 @@ MAX_RESHOOT_ATTEMPTS = 3             # initial fill + up to 2 escalating retries
 OVERLAP_LOG_FILE = "overlap_log.csv"
 UNRESOLVED_PREFIX = "UNRESOLVED_"    # tag applied to a waypoint's photos if escalation never resolved
 
-# Fill this in on-site from the actual room/wall you're using.
-ROUTE = [
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-    {"forward_m": 0.3, "turn_deg": 0},
-]
+# Denser spacing (0.2m legs) is the deliberate prevention measure this time,
+# a fixed design choice rather than a live guess - set the count to match
+# your actual route length on-site (this example: 25 legs = 5.0m).
+ROUTE = [{"forward_m": 0.2, "turn_deg": 0} for _ in range(25)]
 
 RUN_ID = time.strftime("%Y%m%d_%H%M%S")
 cumulative_turn = 0.0                # tracks how far the CHASSIS has turned

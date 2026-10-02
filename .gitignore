@@ -4,3 +4,12 @@ __pycache__/
 .DS_Store
 *.MP4
 *.mp4
+
+datasets/
+runs/
+reports/
+site_negatives/
+*.zip
+*.pt
+crack_test_*.jpg
+IMG_*.JPG
