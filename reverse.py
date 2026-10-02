@@ -28,7 +28,7 @@ EXTRA_TILT_WAYPOINTS = set()
 EXTRA_TILT = 12
 
 CEILING_ENABLED = True
-CEILING_TILT = -25         # confirmed real limit is -30, keeping 5 degrees of margin
+CEILING_TILT = 85          # positive is up; +90 is straight up (tested), -30 is the down limit
 
 MIN_BATTERY_V = 10.3
 
