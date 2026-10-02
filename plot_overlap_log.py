@@ -1,65 +1,147 @@
 """
 plot_overlap_log.py
-Reads overlap_log.csv and plots verified matches, split into separate
-charts by actual run type, matched by exact run_id, not by label guessing.
+Plots the self-check log, one chart per run.
+
+Usage (Mac Terminal, project folder):
+    python3 plot_overlap_log.py                      # all runs in overlap_log.csv
+    python3 plot_overlap_log.py --run 20261004_101500
+    python3 plot_overlap_log.py --file overlap_log_sept.csv
+    python3 plot_overlap_log.py --no-show            # save PNGs only
+
+What is drawn for each run:
+  - blue line     : verified matches at each waypoint (first check)
+  - red X         : the first check was below threshold, so a reshoot was triggered
+  - green circle  : a re-check after the reshoot passed (fix confirmed)
+  - red circle    : a re-check after the reshoot still failed
+  - black diamond : escalated, waypoint left UNRESOLVED after all attempts
+  - grey dashed   : threshold
+
+Old-format logs (no re-check columns) are still accepted; they just show
+the line and the red X markers.
 """
+import argparse
 import csv
-import matplotlib.pyplot as plt
+import re
 from collections import defaultdict
 
-LOG_FILE = "overlap_log.csv"
-THRESHOLD = 25
-
-# Exact run_id timestamps for each real route today, from the terminal logs
-STRAIGHT_RUN_IDS = {"20260923_103336", "20260923_105100", "20260923_110922"}
-ARM_RUN_IDS = {"20260923_123218", "20260923_124111", "20260923_124437"}
-
-straight_runs = defaultdict(list)
-arm_runs = defaultdict(list)
-
-with open(LOG_FILE, newline="") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        run_id = row["run_id"]
-        waypoint = row["waypoint"]
-        matches = int(row["verified_matches"])
-        fill_triggered = row["fill_triggered"].strip().lower() == "true"
-
-        if run_id in STRAIGHT_RUN_IDS:
-            straight_runs[run_id].append((waypoint, matches, fill_triggered))
-        elif run_id in ARM_RUN_IDS:
-            arm_runs[run_id].append((waypoint, matches, fill_triggered))
+import matplotlib
+import matplotlib.pyplot as plt
 
 
-def plot_group(runs, title, filename):
-    if not runs:
-        print("No data for", title)
-        return
+def to_bool(value):
+    return str(value).strip().lower() in ("true", "1", "yes", "y")
+
+
+def to_int(value):
+    try:
+        return int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def wp_number(label):
+    """'wp07', '7' or 7 -> 7"""
+    m = re.search(r"\d+", str(label))
+    return int(m.group()) if m else None
+
+
+def load(path):
+    runs = defaultdict(lambda: defaultdict(list))  # run_id -> wp -> rows
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            wp = wp_number(row.get("waypoint"))
+            if wp is None or to_int(row.get("verified_matches")) is None:
+                continue
+            runs[row["run_id"]][wp].append(row)
+    return runs
+
+
+def plot_run(run_id, wps, show_names=True):
+    waypoints = sorted(wps)
+    x = list(range(len(waypoints)))
+    first = [wps[w][0] for w in waypoints]
+    y = [to_int(r["verified_matches"]) for r in first]
+    threshold = to_int(first[0].get("threshold")) or 25
+
     fig, ax = plt.subplots(figsize=(12, 6))
-    colors = plt.cm.tab10.colors
-    for i, (run_id, points) in enumerate(runs.items()):
-        points_sorted = sorted(points, key=lambda p: int(p[0]))
-        x_labels = [str(p[0]) for p in points_sorted]
-        x = list(range(len(points_sorted)))
-        y = [p[1] for p in points_sorted]
-        fill_flags = [p[2] for p in points_sorted]
-        color = colors[i % len(colors)]
-        ax.plot(x, y, marker="o", label=run_id, color=color, alpha=0.8)
-        for xi, yi, flagged in zip(x, y, fill_flags):
-            if flagged:
-                ax.scatter([xi], [yi], marker="x", s=150, color="red", zorder=5)
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, rotation=45, ha="right")
-    ax.axhline(y=THRESHOLD, color="gray", linestyle="--", label="Fill threshold (%d)" % THRESHOLD)
+    ax.plot(x, y, marker="o", color="tab:blue", alpha=0.85, label="First check")
+    ax.axhline(threshold, color="gray", linestyle="--",
+               label="Threshold (%d)" % threshold)
+
+    n_fill = n_fixed = n_failed = n_escalated = 0
+    seen = set()
+
+    def lab(name):
+        if name in seen:
+            return None
+        seen.add(name)
+        return name
+
+    for xi, w in zip(x, waypoints):
+        rows = wps[w]
+        if any(to_bool(r.get("fill_triggered")) for r in rows):
+            n_fill += 1
+            ax.scatter([xi], [to_int(rows[0]["verified_matches"])], marker="x",
+                       s=160, color="red", zorder=5, label=lab("Reshoot triggered"))
+        for r in rows:
+            rc = to_int(r.get("recheck_matches"))
+            if rc is None:
+                continue
+            attempt = to_int(r.get("attempt")) or 1
+            if to_bool(r.get("fix_confirmed")):
+                n_fixed += 1
+                ax.scatter([xi], [rc], marker="o", s=110, facecolors="none",
+                           edgecolors="green", linewidths=2.5, zorder=6,
+                           label=lab("Re-check passed"))
+            else:
+                n_failed += 1
+                ax.scatter([xi], [rc], marker="o", s=110, facecolors="none",
+                           edgecolors="red", linewidths=2.5, zorder=6,
+                           label=lab("Re-check failed"))
+            ax.annotate("a%d" % attempt, (xi, rc), textcoords="offset points",
+                        xytext=(7, 5), fontsize=8)
+        if any(to_bool(r.get("escalated")) for r in rows):
+            n_escalated += 1
+            ax.scatter([xi], [to_int(rows[0]["verified_matches"])], marker="D",
+                       s=90, color="black", zorder=7,
+                       label=lab("Escalated (UNRESOLVED)"))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["wp%02d" % w for w in waypoints], rotation=45, ha="right")
     ax.set_xlabel("Waypoint")
     ax.set_ylabel("Verified matches")
-    ax.set_title(title)
+    ax.set_title("Self-check results, run %s\n%d reshoots, %d re-checks passed, "
+                 "%d re-checks failed, %d escalated"
+                 % (run_id, n_fill, n_fixed, n_failed, n_escalated))
     ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
-    plt.savefig(filename, dpi=150)
-    plt.show()
-    print("Saved chart to", filename)
+    out = "overlap_%s.png" % run_id
+    plt.savefig(out, dpi=150)
+    print("Saved", out)
+    return fig
 
 
-plot_group(straight_runs, "Straight-run self-check results\n(red X = reshoot triggered)", "overlap_log_straight.png")
-plot_group(arm_runs, "W/fan-run self-check results\n(red X = reshoot triggered)", "overlap_log_arms.png")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", default="overlap_log.csv")
+    ap.add_argument("--run", default=None, help="only this run_id")
+    ap.add_argument("--no-show", action="store_true")
+    args = ap.parse_args()
+
+    if args.no_show:
+        matplotlib.use("Agg")
+
+    runs = load(args.file)
+    if args.run:
+        runs = {k: v for k, v in runs.items() if k == args.run}
+    if not runs:
+        print("No matching runs found in", args.file)
+        return
+    for run_id in sorted(runs):
+        plot_run(run_id, runs[run_id])
+    if not args.no_show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
