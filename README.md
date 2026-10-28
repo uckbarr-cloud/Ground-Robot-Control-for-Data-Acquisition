@@ -70,4 +70,4 @@ The first site tests gave 152 findings in 20 reports, every one rated High, and 
 
 ## Acknowledgements
 
-Supervisor: Amit Patwardhan. Course coordinator: Ravdeep Kour. The AI assistant Claude (Anthropic) was used for coding support, analysis and drafting.
+Supervisor: Amit Patwardhan. Course coordinator: Ravdeep Kour. The AI assistant Claude (Anthropic) was used for coding support and analysis.
