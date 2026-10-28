@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-generate_condition_report.py - automated structure condition report (v2)
+generate_condition_report.py - draft structure condition report from robot photos (v3)
 
-Scans the robot photos of one inspection run, runs the crack-segmentation
-model, merges overlapping views of the same defect, sizes each defect,
-grades it, and writes a complete Word report. Every number, table row and
-sentence is generated from the data. The report is always issued as a
-DRAFT: it becomes valid only after a named person reviews and signs it.
+Reads the photos of one inspection run, runs the crack-segmentation model,
+merges detections of the same defect from overlapping photos, sizes and grades
+each finding, and writes a Word report. The report is always a DRAFT: it is
+only valid after a named person has reviewed every finding and signed it.
+
+What changed in v3. The site tests showed every finding rated High and none of
+them a real crack, so three screening rules were added:
+  1. A width is only graded when the photo can measure it. Otherwise the
+     finding is "Unverified" (width not measurable, manual review), not High.
+  2. Detections in the far, angled part of each wall photo are not counted.
+     The next waypoint sees the same part of the wall square-on.
+  3. Known recurring features at this site (the deck edge and two joint lines)
+     are listed separately and do not count as defects.
 
 Usage:
-    python3 generate_condition_report.py                    # latest run in ./photos
-    python3 generate_condition_report.py photos --run 20261004_101500
+    python3 generate_condition_report.py                                   # latest run, 40 cm
+    python3 generate_condition_report.py photos --run 20261024_144211 --distance 40
 """
 import argparse, csv, datetime, glob, os, re, subprocess, sys
 import cv2
@@ -28,17 +36,17 @@ from docx.shared import Cm, Pt, RGBColor
 
 # ============================ CONFIGURATION ============================
 MODEL_PATH = "best_v2.pt"
-LOGO_PATH = "department_seal.png"
+LOGO_PATH = "ltu_logo.png"
 OVERLAP_LOG = "overlap_log.csv"
 CONF_THRESHOLD = 0.25
-GENERATOR = "generate_condition_report.py v2.0"
+GENERATOR = "generate_condition_report.py v3.0"
 
 ASSET = {
     "Asset": "Björkskataleden underpass",
     "Asset ID": "Not assigned",
     "Location": "Luleå, Sweden",
     "Structure type": "Pedestrian and cycle underpass, concrete with textured wall finish",
-    "Section inspected": "One wall and soffit, 5.0 m section",
+    "Section inspected": "One wall, 5.0 m section",
 }
 INSPECTION = {
     "Inspection type": "Automated routine visual inspection (robotic)",
@@ -49,11 +57,12 @@ INSPECTION = {
 ROUTE_SPACING_M = 0.2
 ROUTE_WAYPOINTS = 25
 
-# Pixel to millimetre scale. PLACEHOLDERS until calibrated from a photo of a
-# tape-measured object at the standard distance: mm_per_px = mm / pixels.
-MM_PER_PX = {"Wall": 0.50, "Soffit": 1.15}
-MM_PER_PX_OVERRIDE = {}          # e.g. {"wp07": 0.42} from a visible reference
-SCALE_CALIBRATED = False         # set True once the values above are calibrated
+# Size of one pixel on the wall (mm) at each camera distance (cm), measured from
+# photos of a scale card. The soffit value is an estimate and was not measured.
+WALL_MM_PER_PX = {40: 0.50, 50: 0.63, 60: 0.77, 100: 1.27}
+SOFFIT_MM_PER_PX = 1.15
+DEFAULT_DISTANCE_CM = 40
+SCALE_CALIBRATED = True
 
 SEVERITY_RULES = [(1.0, "Low"), (3.0, "Medium")]   # mean width limits (mm); above = High
 ACTIONS = {
@@ -66,6 +75,22 @@ RATING = {  # overall indicative condition from the worst finding
     "High": "SIGNIFICANT DEFECTS", "Medium": "MODERATE DEFECTS",
     "Low": "MINOR DEFECTS", "Unverified": "REVIEW REQUIRED", None: "NO DEFECTS DETECTED",
 }
+
+# Rule 1: a width is graded only if the smallest severity limit (1 mm) covers at
+# least 3 pixels, and the outline is clearly wider than the roughly 32 px the
+# model draws around any thin line (measured on 121 site findings).
+MIN_PX_ACROSS_LIMIT = 3
+MASK_FLOOR_PX = 32
+
+# Rule 2: the far, angled part of a wall photo. Two of the three photos at each
+# waypoint look along the wall, so the right-hand part and the top of the frame
+# show the wall at a steep angle, where joints look like cracks.
+FAR_ZONE_X = 0.70    # box centre to the right of 70% of the photo width
+FAR_ZONE_Y = 0.20    # box centre in the top 20% of the photo height
+
+# Rule 3: waypoints where a feature that is not a defect was flagged in all six
+# complete 40 cm runs. Valid only for this site and this start position.
+KNOWN_FEATURES = {19: "Joint line", 21: "Deck edge", 23: "Joint line"}
 # ========================================================================
 
 FONT = "Calibri"
@@ -82,7 +107,7 @@ NAME_RE = re.compile(r"^(?P<flag>UNRESOLVED_)?wp(?P<wp>\d+)_(?P<run>\d{8}_\d{6})
 def parse_photo(path):
     m = NAME_RE.match(os.path.basename(path))
     if not m:
-        return None  # skips check_ photos and anything not named by the route scripts
+        return None  # skips calibration photos and anything not named by the route script
     rest = m.group("rest").lower()
     return {"path": path, "wp": int(m.group("wp")), "run": m.group("run"),
             "surface": "Soffit" if rest.startswith("ceiling") else "Wall",
@@ -98,13 +123,9 @@ def collect_photos(folder, run_id=None):
     return run, sorted([i for i in items if i["run"] == run], key=lambda i: (i["wp"], i["path"]))
 
 
-def mm_per_px(photo):
-    return MM_PER_PX_OVERRIDE.get("wp%02d" % photo["wp"], MM_PER_PX[photo["surface"]])
-
-
-def measure(mask, scale):
-    """Length = long side of the rotated bounding box. Mean width = mask area / length,
-    which follows curved cracks better than the box's short side."""
+def measure_px(mask):
+    """Length = long side of the rotated bounding box of the mask. Mean width =
+    mask area / length, which follows curved cracks better than the box's short side."""
     cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None, None
@@ -113,26 +134,40 @@ def measure(mask, scale):
     length_px = max(a, b)
     if length_px <= 0:
         return None, None
-    width_px = cv2.contourArea(c) / length_px
-    return round(width_px * scale, 1), round(length_px * scale)
+    return cv2.contourArea(c) / length_px, length_px
 
 
-def detect(photos):
+def detect(photos, wall_scale, keep_images=True):
+    """Runs the crack model on every photo and returns one entry per detection."""
     from ultralytics import YOLO   # imported here so the report part runs without it
     model = YOLO(MODEL_PATH)
     raw = []
     for ph in photos:
-        r = model(ph["path"], conf=CONF_THRESHOLD, verbose=False)[0]
+        r = model(ph["path"], conf=CONF_THRESHOLD, verbose=False, retina_masks=True)[0]  # masks at full photo size
         if r.boxes is None or len(r.boxes) == 0:
             continue
-        plotted = r.plot()
+        plotted = r.plot() if keep_images else None
+        scale = wall_scale if ph["surface"] == "Wall" else SOFFIT_MM_PER_PX
         for i in range(len(r.boxes)):
-            w = l = None
+            w_px = l_px = None
             if r.masks is not None:
                 m = cv2.resize(r.masks.data[i].cpu().numpy(), (r.orig_shape[1], r.orig_shape[0]))
-                w, l = measure(m > 0.5, mm_per_px(ph))
-            raw.append(dict(ph, conf=float(r.boxes.conf[i]), width_mm=w, length_mm=l, plotted=plotted))
+                w_px, l_px = measure_px(m > 0.5)
+            cx, cy = (float(v) for v in r.boxes.xywhn[i][:2])
+            raw.append(dict(ph, conf=float(r.boxes.conf[i]), cx=cx, cy=cy, scale=scale,
+                            width_px=w_px, length_px=l_px, plotted=plotted))
     return raw
+
+
+def in_far_zone(d):
+    """Rule 2: True if the detection sits in the far, angled part of a wall photo."""
+    return d["surface"] == "Wall" and (d["cx"] > FAR_ZONE_X or d["cy"] < FAR_ZONE_Y)
+
+
+def width_measurable(width_px, scale):
+    """Rule 1: can this photo measure the crack width at all?"""
+    fine_enough = SEVERITY_RULES[0][0] / scale >= MIN_PX_ACROSS_LIMIT
+    return bool(width_px) and fine_enough and width_px >= 2 * MASK_FLOOR_PX
 
 
 def severity(width):
@@ -144,32 +179,48 @@ def severity(width):
     return "High"
 
 
-def build_findings(raw, out_dir):
-    """Overlapping photos show the same defect several times. Detections at the
-    same waypoint and surface are merged into one finding (strongest view kept)."""
+def build_findings(raw, out_dir=None, check_width=True, skip_far_zone=True, known=None):
+    """Overlapping photos show the same defect several times, so detections at the
+    same waypoint and surface are merged into one finding (the strongest view is kept).
+    The keyword options switch rules 1 to 3 on or off (compare_report_fix.py uses this).
+    Returns (defects, known_features)."""
+    known = KNOWN_FEATURES if known is None else known
+    if skip_far_zone:
+        raw = [d for d in raw if not in_far_zone(d)]
     groups = {}
     for d in raw:
         groups.setdefault((d["wp"], d["surface"]), []).append(d)
-    findings = []
-    for n, key in enumerate(sorted(groups), start=1):
+    defects, features = [], []
+    for key in sorted(groups):
         views = groups[key]
         best = max(views, key=lambda d: d["conf"])
-        fid = "F-%02d" % n
-        img = best["plotted"]
-        if img.shape[1] > 1400:
-            img = cv2.resize(img, (1400, int(img.shape[0] * 1400 / img.shape[1])))
-        img_path = os.path.join(out_dir, "annotated", "%s_%s.jpg" % (fid, os.path.splitext(os.path.basename(best["path"]))[0]))
-        cv2.imwrite(img_path, img, [cv2.IMWRITE_JPEG_QUALITY, 88])
-        sev = severity(best["width_mm"])
-        findings.append({
-            "id": fid, "wp": best["wp"], "surface": best["surface"],
-            "dist": round(best["wp"] * ROUTE_SPACING_M, 2), "photo": os.path.basename(best["path"]),
-            "conf": best["conf"], "width": best["width_mm"], "length": best["length_mm"],
-            "severity": sev, "action": ACTIONS[sev][0], "due": ACTIONS[sev][1],
-            "views": len({d["path"] for d in views}), "image": img_path,
-            "scale": "override" if ("wp%02d" % best["wp"]) in MM_PER_PX_OVERRIDE else "default",
-        })
-    return findings
+        w_px, l_px, scale = best["width_px"], best["length_px"], best["scale"]
+        measurable = bool(w_px) and (width_measurable(w_px, scale) if check_width else True)
+        width = round(w_px * scale, 1) if measurable else None
+        sev = severity(width)
+        f = {"wp": best["wp"], "surface": best["surface"], "dist": round(best["wp"] * ROUTE_SPACING_M, 2),
+             "photo": os.path.basename(best["path"]), "conf": best["conf"], "width": width,
+             "width_px": w_px, "length": round(l_px * scale) if l_px else None, "scale": scale,
+             "severity": sev, "action": ACTIONS[sev][0], "due": ACTIONS[sev][1],
+             "views": len({d["path"] for d in views}), "best": best,
+             "known": known.get(best["wp"]) if best["surface"] == "Wall" else None}
+        (features if f["known"] else defects).append(f)
+    for prefix, group in (("F", defects), ("K", features)):
+        for n, f in enumerate(group, start=1):
+            f["id"] = "%s-%02d" % (prefix, n)
+            f["image"] = save_annotated(f, out_dir)
+    return defects, features
+
+
+def save_annotated(f, out_dir):
+    img = f["best"].get("plotted")
+    if not out_dir or img is None:
+        return None
+    if img.shape[1] > 1400:
+        img = cv2.resize(img, (1400, int(img.shape[0] * 1400 / img.shape[1])))
+    path = os.path.join(out_dir, "annotated", "%s_%s.jpg" % (f["id"], os.path.splitext(f["photo"])[0]))
+    cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    return path
 
 
 def selfcheck_stats(run):
@@ -368,11 +419,11 @@ def keep_together(table):
                     p.paragraph_format.keep_with_next = True
 
 
-fmt = lambda v, unit="": "-" if v in (None, 0) else ("%s%s" % (v, unit))
+fmt = lambda v, unit="", none="-": none if v in (None, 0) else ("%s%s" % (v, unit))
 
 
 # ------------------------------ report ------------------------------
-def build_report(findings, photos, run, stats, status, out_dir):
+def build_report(findings, known_list, photos, run, stats, status, out_dir, info):
     now = datetime.datetime.now()
     report_id = "CR-%s" % run
     worst = next((s for s in SEV_ORDER if any(f["severity"] == s for f in findings)), None)
@@ -381,6 +432,9 @@ def build_report(findings, photos, run, stats, status, out_dir):
     n_wall = sum(p["surface"] == "Wall" for p in photos)
     n_soffit = len(photos) - n_wall
     wps = sorted({p["wp"] for p in photos})
+    route_m = max(wps) * ROUTE_SPACING_M
+    surfaces = "wall and soffit" if n_soffit else "wall"
+    asset = dict(ASSET, **{"Section inspected": "One %s, %.1f m section" % (surfaces, route_m)})
     mtimes = [os.path.getmtime(p["path"]) for p in photos]
     t0, t1 = (datetime.datetime.fromtimestamp(min(mtimes)), datetime.datetime.fromtimestamp(max(mtimes)))
     run_date = datetime.datetime.strptime(run, "%Y%m%d_%H%M%S")
@@ -487,19 +541,27 @@ def build_report(findings, photos, run, stats, status, out_dir):
     para(doc, after=6)
 
     counts = {s: sum(f["severity"] == s for f in findings) for s in SEV_ORDER}
-    summary = ("On %s the robot inspected a %.1f m section of %s along %d waypoints. %d images of the wall and soffit "
+    summary = ("On %s the robot inspected a %.1f m section of %s along %d waypoints. %d images of the %s "
                "were screened by the crack-detection model. " %
-               (run_date.strftime("%d %B %Y"), ROUTE_WAYPOINTS * ROUTE_SPACING_M, ASSET["Asset"], len(wps), len(photos)))
+               (run_date.strftime("%d %B %Y"), route_m, ASSET["Asset"], len(wps), len(photos), surfaces))
     if findings:
         top_f = sorted(findings, key=lambda f: (SEV_ORDER.index(f["severity"]), -f["conf"]))[0]
-        summary += ("%d finding(s) were recorded: %d high, %d medium, %d low and %d unverified. The most significant is %s, "
-                    "a %s-severity crack on the %s at waypoint %02d (about %.1f m along the route)%s. Recommended action: %s, %s." %
-                    (len(findings), counts["High"], counts["Medium"], counts["Low"], counts["Unverified"], top_f["id"],
-                     top_f["severity"].lower(), top_f["surface"].lower(), top_f["wp"], top_f["dist"],
-                     (", mean width %.1f mm%s" % (top_f["width"], prov)) if top_f["width"] else "",
-                     top_f["action"].lower(), top_f["due"].lower()))
+        summary += ("%d finding(s) were recorded: %d high, %d medium, %d low and %d unverified. " %
+                    (len(findings), counts["High"], counts["Medium"], counts["Low"], counts["Unverified"]))
+        if top_f["severity"] == "Unverified":
+            summary += ("At this camera distance one pixel covers %.2f mm of wall, so no crack width could be measured "
+                        "and no finding is graded. Every finding needs a manual review of its photo before any action "
+                        "is decided." % info["scale"])
+        else:
+            summary += ("The highest-priority finding is %s, %s severity, on the %s at waypoint %02d (about %.1f m along "
+                        "the route), mean width %.1f mm%s. Recommended action: %s, %s." %
+                        (top_f["id"], top_f["severity"].lower(), top_f["surface"].lower(), top_f["wp"], top_f["dist"],
+                         top_f["width"], prov, top_f["action"].lower(), top_f["due"].lower()))
     else:
         summary += "No defects were detected above the %.0f%% confidence threshold." % (CONF_THRESHOLD * 100)
+    if known_list:
+        summary += (" %d known recurring feature(s) at this site (%s) were also detected; they are listed in Section 4 "
+                    "and not counted as defects." % (len(known_list), ", ".join(sorted({k["known"].lower() for k in known_list}))))
     if stats["available"]:
         summary += (" The overlap self-check triggered %d reshoot(s); %d waypoint(s) remained unresolved." %
                     (stats["triggered"], stats["escalated"]))
@@ -511,10 +573,11 @@ def build_report(findings, photos, run, stats, status, out_dir):
         for f in sorted(concern, key=lambda f: SEV_ORDER.index(f["severity"])):
             p = doc.add_paragraph(style="List Bullet")
             r = p.add_run("%s  %s  " % (f["id"], f["severity"].upper())); r.bold = True; r.font.color.rgb = rgb(HEX[f["severity"]])
-            p.add_run("%s, waypoint %02d (%.1f m), %s mean width%s. %s, %s." %
-                      (f["surface"], f["wp"], f["dist"], fmt(f["width"], " mm"), prov, f["action"], f["due"].lower()))
+            p.add_run("%s, waypoint %02d (%.1f m), mean width %s%s. %s, %s." %
+                      (f["surface"], f["wp"], f["dist"], fmt(f["width"], " mm", "not measurable"), prov, f["action"], f["due"].lower()))
     else:
-        para(doc, "No high or medium severity findings were identified by the automated screening.")
+        para(doc, "No high or medium severity findings were identified by the automated screening."
+                  + (" No finding could be graded; every finding in Section 4 needs a manual review." if counts["Unverified"] else ""))
     doc.add_heading("Recommended next inspection", 2)
     nxt = {"High": "Follow-up inspection within 1 month, after engineer assessment of the high-severity finding(s).",
            "Medium": "Follow-up inspection within 12 months.",
@@ -523,15 +586,17 @@ def build_report(findings, photos, run, stats, status, out_dir):
 
     # ================= 2. ASSET AND INSPECTION DETAILS =================
     doc.add_heading("2. Asset and inspection details", 1)
-    kv_table(doc, list(ASSET.items()) + list(INSPECTION.items()) +
+    kv_table(doc, list(asset.items()) + list(INSPECTION.items()) +
              [("Run ID", run), ("Route", "%d waypoints, %.1f m spacing, %.1f m total" %
                                 (ROUTE_WAYPOINTS, ROUTE_SPACING_M, ROUTE_WAYPOINTS * ROUTE_SPACING_M)),
+              ("Camera distance", "%d cm from the wall (%.2f mm per pixel)" % (info["distance"], info["scale"])),
               ("Detection model", "YOLO segmentation (%s), confidence threshold %.0f%%" % (MODEL_PATH, CONF_THRESHOLD * 100))])
 
     # ================= 3. FINDINGS OVERVIEW =================
     doc.add_heading("3. Findings overview", 1)
     doc.add_picture(os.path.join(charts, "route.png"), width=Cm(17.4))
-    para(doc, "Figure 1. Finding locations along the inspected route. Positions are approximate, derived from the waypoint index.",
+    para(doc, "Figure 1. Finding locations along the inspected route. Positions are approximate: waypoint number "
+              "x 0.2 m from the start of the route (no GPS).",
          8.5, italic=True, color=HEX["grey"], after=10)
     ov = doc.add_table(1, 2)
     borders(ov, None)
@@ -551,13 +616,23 @@ def build_report(findings, photos, run, stats, status, out_dir):
     doc.add_heading("4. Findings register", 1)
     if findings:
         grid(doc, ["ID", "Location", "Surface", "Defect", "Width\n(mm)", "Length\n(mm)", "Conf.", "Severity", "Action", "Due"],
-             [[f["id"], "WP %02d\n%.1f m" % (f["wp"], f["dist"]), f["surface"], "Crack", fmt(f["width"]), fmt(f["length"]),
+             [[f["id"], "WP %02d\n%.1f m" % (f["wp"], f["dist"]), f["surface"], "Crack", fmt(f["width"], "", "n/m"), fmt(f["length"]),
                "%.0f%%" % (f["conf"] * 100), f["severity"], f["action"], f["due"]] for f in findings],
              (1.1, 1.5, 1.3, 1.2, 1.2, 1.3, 1.1, 1.8, 3.6, 3.3), size=8, sev_col=7, center=(0, 1, 4, 5, 6, 7))
-        para(doc, "Widths and lengths are estimated from the segmentation mask%s. Detections of the same defect in "
-                  "overlapping photos are merged into one finding." % prov, 8.5, italic=True, color=HEX["grey"])
+        para(doc, "Widths and lengths are estimated from the segmentation mask%s. n/m = width not measurable at this "
+                  "camera distance. Detections of the same defect in overlapping photos are merged into one finding." % prov,
+             8.5, italic=True, color=HEX["grey"])
     else:
         para(doc, "No findings.")
+    if known_list:
+        doc.add_heading("Known recurring features (not counted as defects)", 2)
+        grid(doc, ["ID", "Location", "Feature", "Conf.", "Source photo"],
+             [[k["id"], "WP %02d\n%.1f m" % (k["wp"], k["dist"]), k["known"], "%.0f%%" % (k["conf"] * 100),
+               k["photo"].replace("_", "_\u200b")] for k in known_list],
+             (1.2, 1.8, 3.0, 1.4, 10.0), size=8, center=(0, 1, 3))
+        para(doc, "These features were flagged in every complete 40 cm run at this site and were checked by eye as not "
+                  "being defects. The list is only valid for this site and this start position.",
+             8.5, italic=True, color=HEX["grey"])
 
     # ================= 5. FINDING DETAILS =================
     if findings:
@@ -574,8 +649,8 @@ def build_report(findings, photos, run, stats, status, out_dir):
         card.rows[0].cells[0].paragraphs[0].add_run().add_picture(f["image"], width=Cm(10.2))
         kv_table(card.rows[0].cells[1], [
             ("Severity", f["severity"] + prov), ("Confidence", "%.0f%%" % (f["conf"] * 100)),
-            ("Mean width", fmt(f["width"], " mm")), ("Length", fmt(f["length"], " mm")),
-            ("Views merged", str(f["views"])), ("Scale", f["scale"]), ("Source photo", f["photo"].replace("_", "_\u200b")),
+            ("Mean width", fmt(f["width"], " mm", "not measurable")), ("Length", fmt(f["length"], " mm")),
+            ("Views merged", str(f["views"])), ("Scale", "%.2f mm/px" % f["scale"]), ("Source photo", f["photo"].replace("_", "_\u200b")),
             ("Action", "%s, %s" % (f["action"], f["due"].lower()))], w=(2.4, 4.4), size=8)
         widths(card, (10.4, 7.0))
         para(doc, "Photo %s. Crack detected on the %s at waypoint %02d, about %.1f m along the route%s." %
@@ -617,25 +692,34 @@ def build_report(findings, photos, run, stats, status, out_dir):
                  ("Unresolved (flagged)", str(stats["escalated"]))]
     else:
         rows += [("Overlap self-check", "No log entries found for this run")]
-    rows += [("Scale calibration", "Calibrated" if SCALE_CALIBRATED else "NOT calibrated - all sizes and grades provisional")]
+    rows += [("Scale calibration", "Calibrated" if SCALE_CALIBRATED else "NOT calibrated - all sizes and grades provisional"),
+             ("Far, angled part of photos", "%d detection(s) not counted (seen square-on from the next waypoint)" % info["far_skipped"]),
+             ("Known recurring features", "%d (listed in Section 4, not counted)" % len(known_list))]
     kv_table(doc, rows)
     doc.add_heading("Not inspected and known limitations", 2)
-    for txt in ["The floor, the opposite wall and everything beyond the %.1f m route were not inspected." % (ROUTE_WAYPOINTS * ROUTE_SPACING_M),
+    for txt in ["The floor, the opposite wall and everything beyond the %.1f m route were not inspected." % route_m,
                 "The model detects cracks only. Spalling, staining, efflorescence and exposed reinforcement are not assessed.",
                 "Findings at the same waypoint and surface are merged, so two separate cracks there may appear as one.",
-                "Widths below about two pixels at the capture distance cannot be resolved reliably.",
+                "At %d cm one pixel covers %.2f mm of wall, so cracks narrower than this cannot be seen. Widths are only "
+                "graded when the photo can measure them; the model's outline is about %d pixels wide whatever it finds."
+                % (info["distance"], info["scale"], MASK_FLOOR_PX),
+                "Detections in the far, angled part of each wall photo are not counted. That part of the wall is seen "
+                "square-on from the next waypoint, but not at the last waypoint of the route.",
                 "Positions along the route are derived from the waypoint index and share the robot's positioning drift."]:
         doc.add_paragraph(txt, style="List Bullet")
 
     # ================= 8. METHODOLOGY =================
     doc.add_heading("8. Methodology", 1)
-    para(doc, "The robot stopped at each waypoint, photographed the wall at three pan angles and the soffit once, and checked "
+    para(doc, "The robot stopped at each waypoint, photographed the wall at three pan angles%s, and checked "
               "overlap with the previous waypoint, re-shooting when overlap was insufficient. Each photo was screened by a YOLO "
               "segmentation model trained on a public crack dataset (4,029 images) and fine-tuned with 50 crack-free images of "
               "this site to suppress false detections on the engraved wall pattern. Crack length is taken from the rotated "
               "bounding box of the mask and mean width as mask area divided by length, converted to millimetres with a "
-              "per-surface scale (wall %.2f mm/px, soffit %.2f mm/px%s)." %
-              (MM_PER_PX["Wall"], MM_PER_PX["Soffit"], "" if SCALE_CALIBRATED else ", not yet calibrated"))
+              "per-surface scale (wall %.2f mm/px%s). Three screening rules are then applied: a width is graded only "
+              "when the photo can measure it (otherwise the finding is Unverified), detections in the far, angled part "
+              "of each wall photo are not counted, and known recurring features at this site are listed separately." %
+              (" and the soffit once" if n_soffit else "", info["scale"],
+               (", soffit %.2f mm/px" % SOFFIT_MM_PER_PX) if n_soffit else ""))
     grid(doc, ["Severity", "Mean crack width", "Action", "Timeframe"],
          [["Low", "under 1.0 mm", ACTIONS["Low"][0], ACTIONS["Low"][1]],
           ["Medium", "1.0 to 3.0 mm", ACTIONS["Medium"][0], ACTIONS["Medium"][1]],
@@ -669,6 +753,8 @@ def main():
     ap.add_argument("folder", nargs="?", default="photos")
     ap.add_argument("--run", default=None, help="run ID, e.g. 20261004_101500 (default: latest found)")
     ap.add_argument("--status", default="Completed", help="run status text shown in the report")
+    ap.add_argument("--distance", type=int, default=DEFAULT_DISTANCE_CM, choices=sorted(WALL_MM_PER_PX),
+                    help="camera distance from the wall in cm (sets the mm per pixel)")
     ap.add_argument("--no-open", action="store_true", help="do not open the report when finished")
     a = ap.parse_args()
 
@@ -679,9 +765,13 @@ def main():
     os.makedirs(os.path.join(out_dir, "annotated"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "charts"), exist_ok=True)
     print("Run %s: %d photos. Running detection ..." % (run, len(photos)))
-    findings = build_findings(detect(photos), out_dir)
-    print("%d finding(s) after merging overlapping views." % len(findings))
-    path = build_report(findings, photos, run, selfcheck_stats(run), a.status, out_dir)
+    wall_scale = WALL_MM_PER_PX[a.distance]
+    raw = detect(photos, wall_scale)
+    info = {"distance": a.distance, "scale": wall_scale, "far_skipped": sum(in_far_zone(d) for d in raw)}
+    findings, known_list = build_findings(raw, out_dir)
+    print("%d finding(s) after merging overlapping views, %d known feature(s), %d detection(s) in the far zone not counted."
+          % (len(findings), len(known_list), info["far_skipped"]))
+    path = build_report(findings, known_list, photos, run, selfcheck_stats(run), a.status, out_dir, info)
     print("Draft report written: %s" % path)
     if sys.platform == "darwin" and not a.no_open:
         subprocess.run(["open", path])

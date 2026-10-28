@@ -1,12 +1,19 @@
+"""
+self_check.py - photo quality checks used during a run.
+
+is_blurry():        variance of the Laplacian; a low score means a blurry photo.
+verified_matches(): counts SIFT feature matches between two photos that agree
+                    with one camera movement (RANSAC on the fundamental matrix).
+                    A low count means the two photos do not overlap enough.
+"""
 import cv2
 import numpy as np
 
 _sift = cv2.SIFT_create(3000)
 _bf = cv2.BFMatcher()
 
-# Both tuned from tonight's kitchen photos (30-140 matches between good
-# neighbors). Recalibrate on the real site before trusting the numbers,
-# see the calibration check in waypoint_route.py.
+# Set from indoor test photos, where neighbouring waypoints gave 30 to 140 verified
+# matches. On the underpass wall the counts were much higher, so 25 is conservative.
 BLUR_THRESHOLD = 25.0
 MIN_VERIFIED_MATCHES = 25
 
@@ -21,6 +28,7 @@ def is_blurry(photo_path):
 def verified_matches(photo_path_a, photo_path_b):
     img_a = cv2.imread(str(photo_path_a))
     img_b = cv2.imread(str(photo_path_b))
+    # CLAHE evens out the contrast, which helps on dim or uneven walls
     gray_a = cv2.createCLAHE(2.0, (8, 8)).apply(cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY))
     gray_b = cv2.createCLAHE(2.0, (8, 8)).apply(cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY))
     k1, d1 = _sift.detectAndCompute(gray_a, None)
@@ -28,7 +36,7 @@ def verified_matches(photo_path_a, photo_path_b):
     if d1 is None or d2 is None:
         return 0
     matches = _bf.knnMatch(d1, d2, k=2)
-    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    good = [m for m, n in matches if m.distance < 0.75 * n.distance]   # Lowe's ratio test
     if len(good) < 12:
         return len(good)
     p1 = np.float32([k1[m.queryIdx].pt for m in good])

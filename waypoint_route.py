@@ -1,3 +1,13 @@
+"""
+waypoint_route.py - the inspection route.
+
+The robot drives along the wall in short legs. At every waypoint it takes three
+photos of the wall (three pan angles), checks that the middle photo overlaps
+enough with the previous waypoint, and if not, backs up and re-shoots.
+Every overlap check is written to overlap_log.csv.
+
+Normally started through run_inspection.py, which also writes the report.
+"""
 import csv
 import os
 import time
@@ -7,35 +17,34 @@ from capture import capture_photo
 from self_check import is_blurry, verified_matches, MIN_VERIFIED_MATCHES
 
 FORWARD_SPEED = 0.3
-DEG_PER_SEC = 11.4
+DEG_PER_SEC = 11.4         # measured turn rate at TURN_RATE
 TURN_RATE = 0.5
 
-SETTLE = 7.0
-CAMERA_SETTLE = 1.2
+SETTLE = 7.0               # seconds to wait after driving, so the robot is still for the photos
+CAMERA_SETTLE = 1.2        # seconds to wait after moving the camera
 
-BASE_TILT = -7
-TILT_VARIANTS = [-15, 10]   # alternate between these by waypoint
-PAN_ANGLES = [-90, -70, -50]       # left, center, right at every stop
+BASE_TILT = -7             # tilt for the fill-in photos taken while backed up
+TILT_VARIANTS = [-5, 10]   # alternate between these by waypoint
+PAN_ANGLES = [-90, -70, -50]   # wall on the left: square-on, then two angles looking along the wall
 EXTRA_TILT_WAYPOINTS = set()
 EXTRA_TILT = 12
 
-CEILING_ENABLED = True     # set False if the tilt hardware can't reach this angle
-CEILING_TILT = 85          # positive is up; +90 is straight up (tested), -30 is the down limit
+CEILING_ENABLED = False    # extra upward photo of the soffit at each waypoint
+CEILING_TILT = 85          # positive is up; +90 is straight up, -30 is the down limit
 
-MIN_BATTERY_V = 10.3                 # stop cleanly before the low-battery line
+MIN_BATTERY_V = 10.3       # end the run cleanly before the battery gets too low
 
-MAX_RESHOOT_ATTEMPTS = 3             # initial fill + up to 2 escalating retries
+MAX_RESHOOT_ATTEMPTS = 3   # back up 0.1, 0.2 and then 0.3 m
 
 OVERLAP_LOG_FILE = "overlap_log.csv"
-UNRESOLVED_PREFIX = "UNRESOLVED_"    # tag applied to a waypoint's photos if escalation never resolved
+UNRESOLVED_PREFIX = "UNRESOLVED_"    # added to a waypoint's photos if the overlap could not be fixed
 
-# Denser spacing (0.2m legs) is the deliberate prevention measure this time,
-# a fixed design choice rather than a live guess - set the count to match
-# your actual route length on-site (this example: 25 legs = 5.0m).
+# 25 legs of 0.2 m = 5.0 m of wall. Short legs keep the overlap between
+# neighbouring waypoints high; change the count to match the wall length.
 ROUTE = [{"forward_m": 0.2, "turn_deg": 0} for _ in range(25)]
 
 RUN_ID = time.strftime("%Y%m%d_%H%M%S")
-cumulative_turn = 0.0                # tracks how far the CHASSIS has turned
+cumulative_turn = 0.0                # how far the robot body has turned in total
 
 
 def log_overlap_check(wp_index, leg_m, matches, fill_triggered, attempt=0,
@@ -54,9 +63,8 @@ def log_overlap_check(wp_index, leg_m, matches, fill_triggered, attempt=0,
 
 
 def tag_files_unresolved(paths):
-    """Renames a waypoint's photo files in place, prefixing each with
-    UNRESOLVED_, so they stand out in the photos folder and don't get fed
-    into photogrammetry by accident without a second look."""
+    """Renames a waypoint's photo files with the UNRESOLVED_ prefix, so they
+    stand out in the photos folder and are checked before photogrammetry."""
     tagged = []
     for path in paths:
         directory, filename = os.path.split(path)
@@ -77,13 +85,15 @@ def battery_ok():
     try:
         s = json.loads(get_status())
         v = s.get("v", 0) / 100.0
+        if v < 5.0:                  # implausible while the robot is running; treat as a bad read
+            return True, None
         return v >= MIN_BATTERY_V, v
     except Exception:
         return True, None            # don't block the run over one bad reading
 
 
 def drive_forward_m(distance_m):
-    """distance_m can be negative to back up (used by the self-check fill-in)."""
+    """Drives a distance in metres, timed from the speed. A negative distance backs up."""
     duration = abs(distance_m) / FORWARD_SPEED
     speed = FORWARD_SPEED if distance_m >= 0 else -FORWARD_SPEED
     try:
@@ -130,10 +140,7 @@ def shoot_pass(wp_index, tilt, pass_label):
 
 
 def ceiling_pass(wp_index):
-    """Extra upward-facing shot(s) at this waypoint, for the underpass
-    ceiling/soffit. Uses the same RGB camera - no new hardware required.
-    Only the pan center angle is used (0), since the ceiling doesn't need
-    the left/right sweep the wall does."""
+    """Extra upward photo of the soffit at this waypoint (camera pan 0)."""
     if not CEILING_ENABLED:
         return
     print("  ceiling pass at waypoint %d" % wp_index)
@@ -146,35 +153,29 @@ def ceiling_pass(wp_index):
 
 
 def capture_at_waypoint(wp_index):
-    """Returns (straight_ahead_path, all_paths) - callers that only care
-    about the overlap-check photo use the first value; callers that may
-    need to tag every file for this waypoint (e.g. on unresolved escalation)
-    use the second."""
+    """Takes the photos at one waypoint. Returns (middle photo, all photos):
+    the middle photo (pan -70) is used for the overlap check."""
     tilt = TILT_VARIANTS[wp_index % len(TILT_VARIANTS)]
     paths = shoot_pass(wp_index, tilt, "base")
     if wp_index in EXTRA_TILT_WAYPOINTS:
         shoot_pass(wp_index, EXTRA_TILT, "high")
     ceiling_pass(wp_index)
     move_camera(0, 0)
-    return paths[1], paths  # paths[1] is the straight-ahead (pan=0) shot
+    return paths[1], paths  # paths[1] is the middle wall shot (pan -70)
 
 
-def check_overlap_and_fill(prev_photo, wp_index, leg_m):
+def check_overlap_and_fill(prev_photo, this_photo, wp_index, leg_m):
     """
-    Checks overlap against the previous waypoint. If it's too low, backs up,
-    fills the gap, and re-shoots. Then RE-CHECKS the reshoot against the same
-    reference photo, rather than trusting it blindly. If the fix didn't work,
-    tries again with a larger back-up distance, up to MAX_RESHOOT_ATTEMPTS
-    total attempts. If it still hasn't fixed itself after that, this
-    waypoint's photo files are renamed with an UNRESOLVED_ prefix so they
-    stand out in the photos folder before you ever open Metashape, and the
-    run continues rather than halting over one bad waypoint.
+    The self-check. Compares this waypoint's middle photo with the previous one.
+    If there are too few verified matches, the robot backs up, takes fill-in
+    photos, comes back and re-shoots, then checks again against the same
+    previous photo. Each attempt backs up further (0.1, 0.2, 0.3 m). If the
+    overlap is still too low after MAX_RESHOOT_ATTEMPTS, the photos are tagged
+    UNRESOLVED_ and the run continues.
 
-    Returns the straight-ahead photo path to use going forward as "the real
-    photo at this waypoint" (renamed if unresolved), or None if no fill was
-    ever triggered, meaning the caller should keep using its original photo.
+    Returns the new middle photo if a re-shoot happened, otherwise None.
     """
-    matches = verified_matches(prev_photo, capture_photo("check_%s_wp%02d" % (RUN_ID, wp_index)))
+    matches = verified_matches(prev_photo, this_photo)
     print("  overlap check: %d verified matches" % matches)
 
     fill_triggered = matches < MIN_VERIFIED_MATCHES
@@ -246,7 +247,7 @@ if __name__ == "__main__":
 
         print("Waypoint", i)
         this_photo, _ = capture_at_waypoint(i)
-        fixed_photo = check_overlap_and_fill(last_photo, i, leg["forward_m"])
+        fixed_photo = check_overlap_and_fill(last_photo, this_photo, i, leg["forward_m"])
         last_photo = fixed_photo if fixed_photo is not None else this_photo
 
     print("Done.")

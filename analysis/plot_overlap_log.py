@@ -3,10 +3,10 @@ plot_overlap_log.py
 Plots the self-check log, one chart per run.
 
 Usage (Mac Terminal, project folder):
-    python3 plot_overlap_log.py                      # all runs in overlap_log.csv
-    python3 plot_overlap_log.py --run 20261004_101500
-    python3 plot_overlap_log.py --file overlap_log_sept.csv
-    python3 plot_overlap_log.py --no-show            # save PNGs only
+    python3 analysis/plot_overlap_log.py                      # all runs in overlap_log.csv
+    python3 analysis/plot_overlap_log.py --run 20261004_101500
+    python3 analysis/plot_overlap_log.py --file overlap_log_sept.csv
+    python3 analysis/plot_overlap_log.py --no-show            # save PNGs only
 
 What is drawn for each run:
   - blue line     : verified matches at each waypoint (first check)

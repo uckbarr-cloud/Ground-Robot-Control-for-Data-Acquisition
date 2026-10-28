@@ -1,1 +1,7 @@
 requests
+numpy
+opencv-python
+matplotlib
+pandas
+python-docx
+ultralytics
